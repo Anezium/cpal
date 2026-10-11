@@ -696,6 +696,24 @@ mod platform_impl {
     }
 }
 
+#[cfg(target_os = "vita")]
+mod platform_impl {
+    pub use crate::host::vita::{
+        Device as VitaDevice, Devices as VitaDevices, Host as VitaHost, Stream as VitaStream,
+        SupportedInputConfigs as VitaSupportedInputConfigs,
+        SupportedOutputConfigs as VitaSupportedOutputConfigs,
+    };
+
+    impl_platform_host!(Vita vita "Vita");
+
+    /// The default host for the current compilation target platform.
+    pub fn default_host() -> Host {
+        VitaHost::new()
+            .expect("the default host should always be available")
+            .into()
+    }
+}
+
 #[cfg(not(any(
     windows,
     target_os = "linux",
@@ -706,6 +724,7 @@ mod platform_impl {
     target_os = "ios",
     target_os = "emscripten",
     target_os = "android",
+    target_os = "vita",
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
 mod platform_impl {
