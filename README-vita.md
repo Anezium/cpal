@@ -85,9 +85,11 @@ RUSTFLAGS="-C target-feature=-neon -L native=$VITASDK/arm-vita-eabi/lib" \
   --target armv7-sony-vita-newlibeabihf -Z build-std=std,panic_unwind
 ```
 
-Le `Cargo.lock` local généré reste ignoré, comme en amont. La recherche de la
-lib statique est explicite pour cette compilation directe ; cargo-vita fournit
-les chemins VitaSDK pour le build du jeu. Aucune nouvelle dépendance ajoutée.
+Le `Cargo.lock` local généré reste ignoré, comme en amont. `build.rs` expose
+`$VITASDK/arm-vita-eabi/lib` à rustc pour la cible Vita : cargo-vita ne fournit
+pas ce chemin à la création de la rlib, où le lien statique doit déjà trouver
+`SceAudio_stub`. Le `-L` de la commande ci-dessus est donc facultatif une fois
+ce script présent. Aucune nouvelle dépendance ajoutée.
 
 **Compilation seule : aucun test console ou émulateur, aucun son entendu.**
 La sortie F32/I16, le rééchantillonnage en fonctionnement, la cadence réelle,
