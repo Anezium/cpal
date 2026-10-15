@@ -19,7 +19,15 @@ use crate::{
 
 const FRAMES: usize = 512;
 const CHANNELS: u16 = 2;
-const RATE: u32 = 48_000;
+// VitaSDK audioout.h permits 44.1 kHz for BGM (MAIN requires 48 kHz).
+// Match the application mixer and avoid its 44.1 -> 48 kHz conversion.
+const RATE: u32 = 44_100;
+// Lower numbers have higher priority. Skin workers use 159 on CPU1/CPU2.
+// CPU1 only: audio may preempt worker 0, but never the CPU0 game thread.
+const PRIORITY: i32 = 128;
+const AFFINITY: i32 = 0x20000;
+// Symphonia MP3 decoding runs in rodio's callback; reserve 1 MiB, not 128 KiB.
+const STACK_BYTES: usize = 1024 * 1024;
 const SAMPLES: usize = FRAMES * CHANNELS as usize;
 const BUFFER_SIZE: SupportedBufferSize = SupportedBufferSize::Range {
     min: FRAMES as u32,
@@ -33,9 +41,42 @@ extern "C" {
     fn sceAudioOutOpenPort(port_type: i32, len: i32, freq: i32, mode: i32) -> i32;
     fn sceAudioOutOutput(port: i32, buffer: *const std::ffi::c_void) -> i32;
     fn sceAudioOutReleasePort(port: i32) -> i32;
+    fn sceAudioOutSetVolume(port: i32, channels: i32, volumes: *const i32) -> i32;
+}
+#[link(name = "SceLibKernel_stub", kind = "static")]
+extern "C" {
+    fn sceKernelGetThreadId() -> i32;
+    fn sceKernelChangeThreadPriority(id: i32, priority: i32) -> i32;
+    fn sceKernelChangeThreadCpuAffinityMask(id: i32, mask: i32) -> i32;
+    fn sceKernelGetThreadInfo(id: i32, info: *mut ThreadInfo) -> i32;
 }
 const SCE_AUDIO_OUT_PORT_TYPE_BGM: i32 = 1;
 const SCE_AUDIO_OUT_MODE_STEREO: i32 = 1;
+
+// VitaSDK SceKernelThreadInfo, 0x80-byte ARM layout; verify effective policy.
+#[repr(C)]
+struct ThreadInfo {
+    size: u32, process: i32, name: [u8; 32], attr: u32, status: u32,
+    entry: u32, stack: u32, stack_size: i32, init_priority: i32, priority: i32,
+    init_affinity: i32, affinity: i32, cpu: i32, last_cpu: i32,
+    wait_type: u32, wait_id: i32, exit_status: i32, run_clocks: u64,
+    intr_preempt: u32, preempt: u32, release: u32, changes: i32,
+    notify: i32, reserved: i32,
+}
+const _: [(); 0x80] = [(); std::mem::size_of::<ThreadInfo>()];
+
+// These are software deadline estimates, not hardware underrun telemetry.
+#[derive(Default)]
+struct Deadlines {
+    late_callbacks: u64,
+    underrun_estimates: u64,
+}
+impl Deadlines {
+    fn observe(&mut self, gap: Option<Duration>, callback: Duration, block: Duration) {
+        self.late_callbacks += u64::from(gap.is_some_and(|g| g > block + Duration::from_millis(1)));
+        self.underrun_estimates += u64::from(callback > block);
+    }
+}
 
 pub struct Host;
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +118,11 @@ fn backend_error(operation: &str, code: i32) -> BackendSpecificError {
     BackendSpecificError {
         description: format!("{} failed: 0x{:08x}", operation, code as u32),
     }
+}
+
+fn time_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis()
 }
 
 fn to_i16(sample: f32) -> i16 {
@@ -204,9 +250,27 @@ impl DeviceTrait for Device {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("cpal-vita-audio".to_owned())
-            .stack_size(128 * 1024)
+            .stack_size(STACK_BYTES)
             .spawn(move || {
                 let _lifetime = WorkerLifetime(worker_state.clone());
+                let id = unsafe { sceKernelGetThreadId() };
+                for (operation, result) in [
+                    ("sceKernelChangeThreadCpuAffinityMask", unsafe { sceKernelChangeThreadCpuAffinityMask(id, AFFINITY) }),
+                    ("sceKernelChangeThreadPriority", unsafe { sceKernelChangeThreadPriority(id, PRIORITY) }),
+                ] {
+                    if result < 0 {
+                        let _ = ready_tx.send(Err(backend_error(operation, result)));
+                        return;
+                    }
+                }
+                let mut info: ThreadInfo = unsafe { std::mem::zeroed() };
+                info.size = std::mem::size_of::<ThreadInfo>() as u32;
+                let info_rc = unsafe { sceKernelGetThreadInfo(id, &mut info) };
+                if info_rc < 0 || info.priority != PRIORITY || info.affinity != AFFINITY
+                    || info.stack_size < STACK_BYTES as i32 {
+                    let _ = ready_tx.send(Err(backend_error(&format!("audio thread policy readback priority={} affinity={:#x} stack={}", info.priority, info.affinity, info.stack_size), info_rc)));
+                    return;
+                }
                 let handle = unsafe {
                     sceAudioOutOpenPort(
                         SCE_AUDIO_OUT_PORT_TYPE_BGM,
@@ -220,6 +284,16 @@ impl DeviceTrait for Device {
                     return;
                 }
                 let port = Port(handle);
+                let volumes = [32768i32; 2];
+                let volume_rc = unsafe { sceAudioOutSetVolume(port.0, 3, volumes.as_ptr()) };
+                if volume_rc < 0 {
+                    let _ = ready_tx.send(Err(backend_error("sceAudioOutSetVolume", volume_rc)));
+                    return;
+                }
+                eprintln!("[cpal/vita] time_ms={} port=BGM rate={} frames={} block_ms={:.3} priority={} affinity={:#x} stack_bytes={} volume=32768 thread_id={} info_rc={} effective_priority={} effective_affinity={:#x} effective_stack_bytes={}",
+                    time_ms(), RATE, FRAMES, FRAMES as f64 * 1000.0 / RATE as f64,
+                    PRIORITY, AFFINITY, STACK_BYTES, id, info_rc,
+                    info.priority, info.affinity, info.stack_size);
                 let mut pcm = vec![0i16; SAMPLES];
                 let mut floats = vec![
                     0f32;
@@ -235,12 +309,19 @@ impl DeviceTrait for Device {
                     return;
                 }
 
+                let mut previous_callback = None;
+                let mut report_at = Instant::now();
+                let mut deadlines = Deadlines::default();
                 while !worker_state.stop.load(Ordering::Acquire) {
                     if !worker_state.playing.load(Ordering::Acquire) {
                         // unpark's token prevents a lost wakeup between the check and park.
+                        previous_callback = None;
                         thread::park();
                         continue;
                     }
+                    let started = Instant::now();
+                    let gap = previous_callback.map(|previous| started.duration_since(previous));
+                    previous_callback = Some(started);
                     let elapsed = origin.elapsed();
                     let callback =
                         StreamInstant::new(elapsed.as_secs() as i64, elapsed.subsec_nanos());
@@ -267,6 +348,16 @@ impl DeviceTrait for Device {
                             Data::from_parts(pcm.as_mut_ptr().cast(), SAMPLES, SampleFormat::I16)
                         };
                         data_callback(&mut data, &info);
+                    }
+                    deadlines.observe(gap, started.elapsed(), block_duration);
+                    if report_at.elapsed() >= Duration::from_secs(1) {
+                        if deadlines.late_callbacks != 0 || deadlines.underrun_estimates != 0 {
+                            eprintln!("[cpal/vita] time_ms={} late_callbacks={} underrun_estimates={} window_ms={} elapsed_ms={}",
+                                time_ms(), deadlines.late_callbacks, deadlines.underrun_estimates,
+                                report_at.elapsed().as_millis(), origin.elapsed().as_millis());
+                        }
+                        deadlines = Deadlines::default();
+                        report_at = Instant::now();
                     }
                     if worker_state.stop.load(Ordering::Acquire)
                         || !worker_state.playing.load(Ordering::Acquire)
@@ -332,5 +423,28 @@ impl Drop for Stream {
                 let _ = worker.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn deadlines_count_only_late_work_and_ignore_first_callback() {
+        let block = Duration::from_secs_f64(FRAMES as f64 / RATE as f64);
+        let mut d = Deadlines::default();
+        d.observe(None, Duration::from_millis(2), block);
+        d.observe(Some(block), Duration::from_millis(3), block);
+        assert_eq!((d.late_callbacks, d.underrun_estimates), (0, 0));
+        d.observe(Some(block + Duration::from_millis(2)), block + Duration::from_nanos(1), block);
+        assert_eq!((d.late_callbacks, d.underrun_estimates), (1, 1));
+    }
+    #[test]
+    fn pcm_conversion_clamps_and_silences_non_finite_samples() {
+        assert_eq!(to_i16(1.0), i16::MAX);
+        assert_eq!(to_i16(-1.0), i16::MIN);
+        assert_eq!(to_i16(2.0), i16::MAX);
+        assert_eq!(to_i16(f32::NAN), 0);
+        assert_eq!(to_i16(f32::INFINITY), 0);
     }
 }
