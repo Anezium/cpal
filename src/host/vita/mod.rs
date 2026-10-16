@@ -65,16 +65,37 @@ struct ThreadInfo {
 }
 const _: [(); 0x80] = [(); std::mem::size_of::<ThreadInfo>()];
 
-// These are software deadline estimates, not hardware underrun telemetry.
-#[derive(Default)]
+// Software callback+conversion timings, excluding blocking hardware output.
+// Fixed buckets avoid allocation or sorting on the audio thread. Percentiles
+// are upper bounds at 0.1 ms resolution; max is exact to the recorded us.
 struct Deadlines {
     late_callbacks: u64,
     underrun_estimates: u64,
+    histogram: [u32; 256],
+    callbacks: u32,
+    max_us: u64,
+}
+impl Default for Deadlines {
+    fn default() -> Self { Self { late_callbacks: 0, underrun_estimates: 0,
+        histogram: [0; 256], callbacks: 0, max_us: 0 } }
 }
 impl Deadlines {
     fn observe(&mut self, gap: Option<Duration>, callback: Duration, block: Duration) {
         self.late_callbacks += u64::from(gap.is_some_and(|g| g > block + Duration::from_millis(1)));
         self.underrun_estimates += u64::from(callback > block);
+        let us = callback.as_micros() as u64;
+        self.histogram[(us / 100).min(255) as usize] += 1;
+        self.callbacks += 1;
+        self.max_us = self.max_us.max(us);
+    }
+    fn percentile_us(&self, percent: u32) -> u64 {
+        let wanted = (self.callbacks * percent).div_ceil(100);
+        let mut total = 0;
+        for (bucket, count) in self.histogram.iter().enumerate() {
+            total += count;
+            if total >= wanted { return if bucket == 255 { self.max_us } else { (bucket as u64 + 1) * 100 }; }
+        }
+        self.max_us
     }
 }
 
@@ -351,11 +372,10 @@ impl DeviceTrait for Device {
                     }
                     deadlines.observe(gap, started.elapsed(), block_duration);
                     if report_at.elapsed() >= Duration::from_secs(1) {
-                        if deadlines.late_callbacks != 0 || deadlines.underrun_estimates != 0 {
-                            eprintln!("[cpal/vita] time_ms={} late_callbacks={} underrun_estimates={} window_ms={} elapsed_ms={}",
-                                time_ms(), deadlines.late_callbacks, deadlines.underrun_estimates,
-                                report_at.elapsed().as_millis(), origin.elapsed().as_millis());
-                        }
+                        eprintln!("[cpal/vita] time_ms={} late_callbacks={} underrun_estimates={} window_ms={} elapsed_ms={} callbacks={} callback_p50_us={} callback_p95_us={} callback_max_us={} percentile_resolution_us=100",
+                            time_ms(), deadlines.late_callbacks, deadlines.underrun_estimates,
+                            report_at.elapsed().as_millis(), origin.elapsed().as_millis(), deadlines.callbacks,
+                            deadlines.percentile_us(50), deadlines.percentile_us(95), deadlines.max_us);
                         deadlines = Deadlines::default();
                         report_at = Instant::now();
                     }
@@ -429,6 +449,18 @@ impl Drop for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn callback_percentiles_include_silence_and_overflow_max() {
+        let mut d = Deadlines::default();
+        for us in [20, 90, 101, 250, 12000, 90000] {
+            d.observe(None, Duration::from_micros(us), Duration::from_micros(11610));
+        }
+        assert_eq!(d.percentile_us(50), 200);
+        assert_eq!(d.percentile_us(95), 90000);
+        assert_eq!(d.max_us, 90000);
+        assert_eq!(d.callbacks, 6);
+        assert_eq!(d.underrun_estimates, 2);
+    }
     #[test]
     fn deadlines_count_only_late_work_and_ignore_first_callback() {
         let block = Duration::from_secs_f64(FRAMES as f64 / RATE as f64);
